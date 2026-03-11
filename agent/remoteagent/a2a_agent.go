@@ -15,17 +15,16 @@
 package remoteagent
 
 import (
-	"encoding/json"
 	"fmt"
 	"iter"
-	"os"
-	"strings"
 
 	"github.com/a2aproject/a2a-go/a2a"
 	"github.com/a2aproject/a2a-go/a2aclient"
 	"github.com/a2aproject/a2a-go/a2aclient/agentcard"
 
 	"google.golang.org/adk/agent"
+	agentinternal "google.golang.org/adk/internal/agent"
+	iremoteagent "google.golang.org/adk/internal/agent/remoteagent"
 	icontext "google.golang.org/adk/internal/context"
 	"google.golang.org/adk/server/adka2a"
 	"google.golang.org/adk/session"
@@ -115,8 +114,15 @@ func NewA2A(cfg A2AConfig) (agent.Agent, error) {
 		return nil, fmt.Errorf("either AgentCard or AgentCardSource must be provided")
 	}
 
-	remoteAgent := &a2aAgent{resolvedCard: cfg.AgentCard}
-	return agent.New(agent.Config{
+	remoteAgent := &a2aAgent{
+		serverConfig: &iremoteagent.A2AServerConfig{
+			AgentCard:          cfg.AgentCard,
+			AgentCardSource:    cfg.AgentCardSource,
+			CardResolveOptions: cfg.CardResolveOptions,
+			ClientFactory:      cfg.ClientFactory,
+		},
+	}
+	agent, err := agent.New(agent.Config{
 		Name:                 cfg.Name,
 		Description:          cfg.Description,
 		BeforeAgentCallbacks: cfg.BeforeAgentCallbacks,
@@ -125,27 +131,28 @@ func NewA2A(cfg A2AConfig) (agent.Agent, error) {
 			return remoteAgent.run(ic, cfg)
 		},
 	})
+	if err != nil {
+		return nil, err
+	}
+
+	internalAgent, ok := agent.(agentinternal.Agent)
+	if !ok {
+		return nil, fmt.Errorf("internal error: failed to convert to internal agent")
+	}
+	state := agentinternal.Reveal(internalAgent)
+	state.AgentType = agentinternal.TypeRemoteAgent
+	state.Config = iremoteagent.RemoteAgentState{A2A: remoteAgent.serverConfig}
+
+	return agent, nil
 }
 
 type a2aAgent struct {
-	resolvedCard *a2a.AgentCard
+	serverConfig *iremoteagent.A2AServerConfig
 }
 
 func (a *a2aAgent) run(ctx agent.InvocationContext, cfg A2AConfig) iter.Seq2[*session.Event, error] {
 	return func(yield func(*session.Event, error) bool) {
-		card, err := resolveAgentCard(ctx, cfg)
-		if err != nil {
-			yield(toErrorEvent(ctx, fmt.Errorf("agent card resolution failed: %w", err)), nil)
-			return
-		}
-		a.resolvedCard = card
-
-		var client *a2aclient.Client
-		if cfg.ClientFactory != nil {
-			client, err = cfg.ClientFactory.CreateFromCard(ctx, card)
-		} else {
-			client, err = a2aclient.NewFromCard(ctx, card)
-		}
+		client, err := iremoteagent.CreateA2AClient(ctx, a.serverConfig)
 		if err != nil {
 			yield(toErrorEvent(ctx, fmt.Errorf("client creation failed: %w", err)), nil)
 			return
@@ -159,6 +166,7 @@ func (a *a2aAgent) run(ctx agent.InvocationContext, cfg A2AConfig) iter.Seq2[*se
 		}
 
 		req := &a2a.MessageSendParams{Message: msg, Config: cfg.MessageSendConfig}
+
 		processor := newRunProcessor(cfg, req)
 
 		if bcbResp, bcbErr := processor.runBeforeA2ARequestCallbacks(ctx); bcbResp != nil || bcbErr != nil {
@@ -251,31 +259,6 @@ func toErrorEvent(ctx agent.InvocationContext, err error) *session.Event {
 	event.CustomMetadata = map[string]any{adka2a.ToADKMetaKey("error"): err.Error()}
 	event.TurnComplete = true
 	return event
-}
-
-func resolveAgentCard(ctx agent.InvocationContext, cfg A2AConfig) (*a2a.AgentCard, error) {
-	if cfg.AgentCard != nil {
-		return cfg.AgentCard, nil
-	}
-
-	if strings.HasPrefix(cfg.AgentCardSource, "http://") || strings.HasPrefix(cfg.AgentCardSource, "https://") {
-		card, err := agentcard.DefaultResolver.Resolve(ctx, cfg.AgentCardSource, cfg.CardResolveOptions...)
-		if err != nil {
-			return nil, fmt.Errorf("failed to fetch an agent card: %w", err)
-		}
-		return card, nil
-	}
-
-	fileBytes, err := os.ReadFile(cfg.AgentCardSource)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read agent card from %q: %w", cfg.AgentCardSource, err)
-	}
-
-	var card a2a.AgentCard
-	if err := json.Unmarshal(fileBytes, &card); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal an agent card: %w", err)
-	}
-	return &card, nil
 }
 
 func convertParts(ctx agent.InvocationContext, cfg A2AConfig, event *session.Event) ([]a2a.Part, error) {
