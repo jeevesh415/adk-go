@@ -21,6 +21,7 @@ import (
 	"slices"
 
 	"github.com/a2aproject/a2a-go/a2a"
+	"github.com/a2aproject/a2a-go/a2aclient"
 	"github.com/a2aproject/a2a-go/a2asrv"
 	"github.com/a2aproject/a2a-go/a2asrv/eventqueue"
 	"github.com/a2aproject/a2a-go/log"
@@ -52,8 +53,8 @@ type A2APartConverter func(ctx context.Context, a2aEvent a2a.Event, part a2a.Par
 // nil returns are considered intentionally dropped parts.
 type GenAIPartConverter func(ctx context.Context, adkEvent *session.Event, part *genai.Part) (a2a.Part, error)
 
-// A2AExecutionCleanupCallback is a callback which will be called after an execution or cancellatio  has completed or failed.
-type A2AExecutionCleanupCallback func(ctx context.Context, reqCtx *a2asrv.RequestContext, result a2a.SendMessageResult, сause error)
+// A2AExecutionCleanupCallback is a callback which will be called after an execution or cancellatio has completed or failed.
+type A2AExecutionCleanupCallback func(ctx context.Context, reqCtx *a2asrv.RequestContext, result a2a.SendMessageResult, cause error)
 
 // OutputMode controls how artifacts are produced.
 type OutputMode string
@@ -105,7 +106,7 @@ type ExecutorConfig struct {
 	OutputMode OutputMode
 
 	// A2AExecutionCleanupCallback is a callback which will be called after an execution or cancellation has completed or failed.
-	// If not provided, the default behavior it to log the failure cause when.
+	// If not provided, the default behavior is to log the failure cause, if any.
 	A2AExecutionCleanupCallback A2AExecutionCleanupCallback
 }
 
@@ -245,21 +246,32 @@ func (e *Executor) cancelChildInputRequiredTasks(ctx context.Context, reqCtx *a2
 	}
 
 	var failures []error
+	clientCache := map[string]*a2aclient.Client{}
 	for _, task := range tasksToCancel { // TODO(yarolegovich): run in parallel (how to limit?)
 		remoteSubagentIdx := slices.IndexFunc(remoteSubagents, func(a remoteAgent) bool { return a.agent.Name() == task.agentName })
 		if remoteSubagentIdx < 0 {
 			continue
 		}
 		remoteSubagent := remoteSubagents[remoteSubagentIdx]
-		_, client, err := iremoteagent.CreateA2AClient(ctx, remoteSubagent.config)
-		if err != nil {
-			failures = append(failures, fmt.Errorf("failed to create A2A client: %w", err))
-			continue
+		client, ok := clientCache[task.agentName]
+		if !ok {
+			_, newClient, err := iremoteagent.CreateA2AClient(ctx, remoteSubagent.config)
+			if err != nil {
+				failures = append(failures, fmt.Errorf("failed to create A2A client: %w", err))
+				continue
+			}
+			clientCache[task.agentName] = newClient
+			client = newClient
 		}
 		_, err = client.CancelTask(ctx, &a2a.TaskIDParams{ID: task.taskID})
 		if err != nil {
 			failures = append(failures, fmt.Errorf("failed to cancel task: %w", err))
 			continue
+		}
+	}
+	for _, client := range clientCache {
+		if err := client.Destroy(); err != nil {
+			failures = append(failures, fmt.Errorf("client destroy failed: %w", err))
 		}
 	}
 	return errors.Join(failures...)
