@@ -28,7 +28,6 @@ import (
 	"google.golang.org/adk/agent"
 	agentinternal "google.golang.org/adk/internal/agent"
 	iremoteagent "google.golang.org/adk/internal/agent/remoteagent"
-	icontext "google.golang.org/adk/internal/context"
 	"google.golang.org/adk/server/adka2a"
 	"google.golang.org/adk/session"
 )
@@ -40,7 +39,7 @@ import (
 type BeforeA2ARequestCallback func(ctx agent.CallbackContext, req *a2a.MessageSendParams) (*session.Event, error)
 
 // A2AEventConverter can be used to provide a custom implementation of A2A event transformation logic.
-type A2AEventConverter func(ctx agent.ReadonlyContext, req *a2a.MessageSendParams, event a2a.Event, err error) (*session.Event, error)
+type A2AEventConverter func(ctx agent.InvocationContext, req *a2a.MessageSendParams, event a2a.Event, err error) (*session.Event, error)
 
 // AfterA2ARequestCallback is called after receiving a response from the remote agent and converting it to a session.Event.
 // In streaming responses the callback is invoked for every request. Session event parameter might be nil if conversion logic
@@ -49,8 +48,8 @@ type A2AEventConverter func(ctx agent.ReadonlyContext, req *a2a.MessageSendParam
 // If it returns non-nil result or error, it gets emitted instead of the original result.
 type AfterA2ARequestCallback func(ctx agent.CallbackContext, req *a2a.MessageSendParams, resp *session.Event, err error) (*session.Event, error)
 
-// A2ARemoteTaskCleanupCallback is called if Run context was canceled before a terminal event was received from the remote A2A server.
-type A2ARemoteTaskCleanupCallback func(ctx context.Context, client *a2aclient.Client, taskID a2a.TaskID)
+// A2ARemoteTaskCleanupCallback is called if Run exited before a terminal event was received from the remote A2A server.
+type A2ARemoteTaskCleanupCallback func(ctx context.Context, card *a2a.AgentCard, client *a2aclient.Client, taskInfo a2a.TaskInfo, cause error)
 
 // A2AConfig is used to describe and configure a remote agent.
 type A2AConfig struct {
@@ -112,9 +111,10 @@ type A2AConfig struct {
 	// MessageSendConfig is attached to a2a.MessageSendParams sent on every agent invocation.
 	MessageSendConfig *a2a.MessageSendConfig
 
-	// RemoteTaskCleanupCallback is called if Run context was canceled before a terminal event was received from the remote A2A server.
+	// RemoteTaskCleanupCallback is called if Run exited before a terminal event was received from the remote A2A server.
+	// If Run exited due to an error including context cancellation it will be passed as cause.
+	// The context passed to this callback is the original context, but with Err() removed by context.WithoutCancel.
 	// If no callback is provided the default behavior is to make a cancel RPC request with 5 second timeout.
-	// The context passed to this callback is the original context with Err() still set.
 	RemoteTaskCleanupCallback A2ARemoteTaskCleanupCallback
 }
 
@@ -163,7 +163,7 @@ type a2aAgent struct {
 
 func (a *a2aAgent) run(ctx agent.InvocationContext, cfg A2AConfig) iter.Seq2[*session.Event, error] {
 	return func(yield func(*session.Event, error) bool) {
-		client, err := iremoteagent.CreateA2AClient(ctx, a.serverConfig)
+		agentCard, client, err := iremoteagent.CreateA2AClient(ctx, a.serverConfig)
 		if err != nil {
 			yield(toErrorEvent(ctx, fmt.Errorf("client creation failed: %w", err)), nil)
 			return
@@ -199,37 +199,52 @@ func (a *a2aAgent) run(ctx agent.InvocationContext, cfg A2AConfig) iter.Seq2[*se
 			return
 		}
 
+		var lastErr error
+		yieldErr := func(err error) bool {
+			lastErr = err
+			return yield(nil, err)
+		}
+
 		var lastEvent a2a.Event
 		defer func() {
-			cleanupRemoteTaskOnContextCancelation(ctx, cfg, client, lastEvent)
+			err := lastErr
+			if err == nil && ctx.Err() != nil {
+				err = context.Cause(ctx)
+			}
+			cleanupRemoteTask(ctx, cfg, agentCard, client, lastEvent, err)
 		}()
 
 		processEvent := func(a2aEvent a2a.Event, a2aErr error) bool {
-			lastEvent = a2aEvent
+			if a2aEvent != nil {
+				lastEvent = a2aEvent
+			}
 
 			var err error
 			var event *session.Event
 			if cfg.Converter != nil {
-				event, err = cfg.Converter(icontext.NewReadonlyContext(ctx), req, a2aEvent, a2aErr)
+				event, err = cfg.Converter(ctx, req, a2aEvent, a2aErr)
 			} else {
 				event, err = processor.convertToSessionEvent(ctx, a2aEvent, a2aErr)
 			}
 
 			if cbResp, cbErr := processor.runAfterA2ARequestCallbacks(ctx, event, err); cbResp != nil || cbErr != nil {
 				if cbErr != nil {
-					return yield(nil, cbErr)
+					return yieldErr(cbErr)
 				}
 				event = cbResp
 				err = nil
 			}
 
 			if err != nil {
-				return yield(nil, err)
+				return yieldErr(err)
 			}
 
 			if event != nil { // an event might be skipped
 				for _, toEmit := range processor.aggregatePartial(ctx, a2aEvent, event) {
 					if !yield(toEmit, nil) {
+						return false
+					}
+					if toEmit.TurnComplete {
 						return false
 					}
 				}
@@ -251,11 +266,10 @@ func (a *a2aAgent) run(ctx agent.InvocationContext, cfg A2AConfig) iter.Seq2[*se
 	}
 }
 
-func cleanupRemoteTaskOnContextCancelation(ctx context.Context, cfg A2AConfig, client *a2aclient.Client, lastEvent a2a.Event) {
-	if lastEvent == nil || ctx.Err() == nil {
+func cleanupRemoteTask(ctx context.Context, cfg A2AConfig, card *a2a.AgentCard, client *a2aclient.Client, lastEvent a2a.Event, cause error) {
+	if lastEvent == nil {
 		return
 	}
-
 	taskID := lastEvent.TaskInfo().TaskID
 	if taskID == "" {
 		return
@@ -263,19 +277,28 @@ func cleanupRemoteTaskOnContextCancelation(ctx context.Context, cfg A2AConfig, c
 	if _, ok := lastEvent.(*a2a.Message); ok {
 		return
 	}
-	if tu, ok := lastEvent.(*a2a.TaskStatusUpdateEvent); ok && tu.Status.State.Terminal() {
+	var state a2a.TaskState
+	if tu, ok := lastEvent.(*a2a.TaskStatusUpdateEvent); ok {
+		state = tu.Status.State
+	}
+	if t, ok := lastEvent.(*a2a.Task); ok {
+		state = t.Status.State
+	}
+	if state.Terminal() {
 		return
 	}
-	if t, ok := lastEvent.(*a2a.Task); ok && t.Status.State.Terminal() {
-		return
-	}
+
+	ctx = context.WithoutCancel(ctx)
 
 	if cfg.RemoteTaskCleanupCallback != nil {
-		cfg.RemoteTaskCleanupCallback(ctx, client, taskID)
+		cfg.RemoteTaskCleanupCallback(ctx, card, client, lastEvent.TaskInfo(), cause)
 		return
 	}
 
-	cancelCtx, cancelTimeout := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	if state == a2a.TaskStateInputRequired && cause == nil {
+		return
+	}
+	cancelCtx, cancelTimeout := context.WithTimeout(ctx, 5*time.Second)
 	defer cancelTimeout()
 	_, err := client.CancelTask(cancelCtx, &a2a.TaskIDParams{ID: taskID})
 	if err != nil {

@@ -26,11 +26,14 @@ import (
 	"net/http"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/a2aproject/a2a-go/a2a"
 	"github.com/a2aproject/a2a-go/a2aclient"
 	"github.com/a2aproject/a2a-go/a2asrv"
+	"github.com/a2aproject/a2a-go/a2asrv/eventqueue"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"google.golang.org/genai"
@@ -367,6 +370,93 @@ func TestA2AMultiHopInputRequired(t *testing.T) {
 				t.Fatalf("unexpected artifact parts (+got,-want) diff:\n%s", diff)
 			}
 		})
+	}
+}
+
+func TestA2ACleanupPropagation(t *testing.T) {
+	// Remote A2A server publishes a submitted task and start generating artifact updates
+	// until it detects a context cancelation
+	remoteTaskIDChan := make(chan a2a.TaskID, 1)
+	serverB := startA2AServer(&mockA2AExecutor{
+		executeFn: func(ctx context.Context, reqCtx *a2asrv.RequestContext, queue eventqueue.Queue) error {
+			remoteTaskIDChan <- reqCtx.TaskID
+			if err := queue.Write(ctx, a2a.NewSubmittedTask(reqCtx, reqCtx.Message)); err != nil {
+				return err
+			}
+			for ctx.Err() == nil {
+				if err := queue.Write(ctx, a2a.NewArtifactEvent(reqCtx, a2a.TextPart{Text: "foo"})); err != nil {
+					return err
+				}
+				time.Sleep(1 * time.Millisecond)
+			}
+			finalUpdate := a2a.NewStatusUpdateEvent(reqCtx, a2a.TaskStateCompleted, nil)
+			finalUpdate.Final = true
+			return queue.Write(ctx, finalUpdate)
+		},
+	})
+	defer serverB.Close()
+
+	// Root server connects to server B through remote subagent
+	remoteAgentB := newA2ARemoteAgent(t, "remote-agent-b", serverB)
+	rootA := newRootAgent("agent-b", remoteAgentB)
+	executorA := newAgentExecutor(rootA, nil, adka2a.OutputArtifactPerEvent)
+	serverA := startA2AServer(executorA)
+	defer serverA.Close()
+
+	client := newA2AClient(t, serverA)
+
+	// Send a streaming message in a detached goroutine, passing status update through chan
+	statusUpdateEventChan := make(chan a2a.Event, 10)
+	go func() {
+		defer close(statusUpdateEventChan)
+		msg := a2a.NewMessage(a2a.MessageRoleUser, a2a.TextPart{Text: "work"})
+		for event, err := range client.SendStreamingMessage(t.Context(), &a2a.MessageSendParams{Message: msg}) {
+			if err != nil {
+				t.Errorf("client.SendStreamingMessage() error = %v", err)
+				return
+			}
+			if _, ok := event.(*a2a.TaskArtifactUpdateEvent); ok {
+				continue
+			}
+			statusUpdateEventChan <- event
+		}
+	}()
+
+	// Issue a task cancellation request
+	taskID := (<-statusUpdateEventChan).TaskInfo().TaskID
+	cancelResultChan := make(chan *a2a.Task, 1)
+	go func() {
+		defer close(cancelResultChan)
+		task, err := client.CancelTask(t.Context(), &a2a.TaskIDParams{ID: taskID})
+		if err != nil {
+			t.Errorf("client.CancelTask() error = %v", err)
+			return
+		}
+		cancelResultChan <- task
+	}()
+
+	// Check the streaming message sender got a cancelled state task in their response
+	var lastStreamingUpdate a2a.Event
+	for event := range statusUpdateEventChan {
+		lastStreamingUpdate = event
+	}
+	if tu, ok := lastStreamingUpdate.(*a2a.TaskStatusUpdateEvent); ok {
+		if tu.Status.State != a2a.TaskStateCanceled {
+			t.Errorf("lastStreamingUpdate.Status.State = %q, want %q", tu.Status.State, a2a.TaskStateCanceled)
+		}
+	} else {
+		t.Fatalf("type(lastStreamingUpdate) = %T, want *a2a.TaskStatusUpdateEvent", lastStreamingUpdate)
+	}
+
+	// Check subagent task got cancelled when the parent task was cancelled
+	remoteTaskID := <-remoteTaskIDChan
+	remoteClient := newA2AClient(t, serverB)
+	remoteTask, err := remoteClient.GetTask(t.Context(), &a2a.TaskQueryParams{ID: remoteTaskID})
+	if err != nil {
+		t.Fatalf("remoteClient.GetTask() error = %v", err)
+	}
+	if remoteTask.Status.State != a2a.TaskStateCanceled {
+		t.Errorf("remoteTask.Status.State = %q, want %q", remoteTask.Status.State, a2a.TaskStateCanceled)
 	}
 }
 
@@ -1028,4 +1118,47 @@ func newGeminiModel(t *testing.T, modelName string) model.LLM {
 		t.Fatalf("failed to create model: %v", err)
 	}
 	return model
+}
+
+type storedTask struct {
+	task    *a2a.Task
+	version a2a.TaskVersion
+}
+
+type taskStore struct {
+	mu    sync.Mutex
+	tasks map[string]*storedTask
+}
+
+var _ a2asrv.TaskStore = (*taskStore)(nil)
+
+func (s *taskStore) Get(ctx context.Context, tid a2a.TaskID) (*a2a.Task, a2a.TaskVersion, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	stored, ok := s.tasks[string(tid)]
+	if !ok {
+		return nil, a2a.TaskVersionMissing, a2a.ErrTaskNotFound
+	}
+	return stored.task, stored.version, nil
+}
+
+func (s *taskStore) Save(ctx context.Context, task *a2a.Task, event a2a.Event, prev *a2a.Task, prevVersion a2a.TaskVersion) (a2a.TaskVersion, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	stored, ok := s.tasks[string(task.ID)]
+	if ok && prevVersion != a2a.TaskVersionMissing && stored.version != prevVersion {
+		return a2a.TaskVersionMissing, a2a.ErrConcurrentTaskModification
+	}
+	version := prevVersion
+	if version == a2a.TaskVersionMissing {
+		version = 1
+	} else {
+		version = prevVersion + 1
+	}
+	s.tasks[string(task.ID)] = &storedTask{task: task, version: version}
+	return version, nil
+}
+
+func (*taskStore) List(ctx context.Context, req *a2a.ListTasksRequest) (*a2a.ListTasksResponse, error) {
+	return nil, fmt.Errorf("not implemented")
 }

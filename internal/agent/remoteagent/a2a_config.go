@@ -30,10 +30,10 @@ type A2AServerConfig struct {
 	ClientFactory *a2aclient.Factory
 }
 
-func CreateA2AClient(ctx context.Context, cfg *A2AServerConfig) (*a2aclient.Client, error) {
+func CreateA2AClient(ctx context.Context, cfg *A2AServerConfig) (*a2a.AgentCard, *a2aclient.Client, error) {
 	card, err := resolveAgentCard(ctx, cfg)
 	if err != nil {
-		return nil, fmt.Errorf("agent card resolution failed: %w", err)
+		return nil, nil, fmt.Errorf("agent card resolution failed: %w", err)
 	}
 
 	var client *a2aclient.Client
@@ -43,9 +43,9 @@ func CreateA2AClient(ctx context.Context, cfg *A2AServerConfig) (*a2aclient.Clie
 		client, err = a2aclient.NewFromCard(ctx, card)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("client creation failed: %w", err)
+		return nil, nil, fmt.Errorf("client creation failed: %w", err)
 	}
-	return client, nil
+	return card, client, nil
 }
 
 func resolveAgentCard(ctx context.Context, cfg *A2AServerConfig) (*a2a.AgentCard, error) {
