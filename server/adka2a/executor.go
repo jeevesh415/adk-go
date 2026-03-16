@@ -54,7 +54,7 @@ type A2APartConverter func(ctx context.Context, a2aEvent a2a.Event, part a2a.Par
 type GenAIPartConverter func(ctx context.Context, adkEvent *session.Event, part *genai.Part) (a2a.Part, error)
 
 // A2AExecutionCleanupCallback is a callback which will be called after an execution or cancellatio has completed or failed.
-type A2AExecutionCleanupCallback func(ctx context.Context, reqCtx *a2asrv.RequestContext, result a2a.SendMessageResult, cause error)
+type A2AExecutionCleanupCallback func(ctx context.Context, reqCtx *a2asrv.RequestContext, subAgentCards []*a2a.AgentCard, result a2a.SendMessageResult, cause error)
 
 // OutputMode controls how artifacts are produced.
 type OutputMode string
@@ -198,20 +198,29 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 }
 
 func (e *Executor) Cancel(ctx context.Context, reqCtx *a2asrv.RequestContext, queue eventqueue.Queue) error {
-	if reqCtx.StoredTask.Status.State == a2a.TaskStateInputRequired {
-		if err := e.cancelChildInputRequiredTasks(ctx, reqCtx, reqCtx.StoredTask.Status); err != nil {
-			log.Warn(ctx, "failed to cancel subagent tasks waiting for input", "cause", err)
-		}
-	}
-
 	event := a2a.NewStatusUpdateEvent(reqCtx, a2a.TaskStateCanceled, nil)
 	event.Final = true
 	return queue.Write(ctx, event)
 }
 
 func (e *Executor) Cleanup(ctx context.Context, reqCtx *a2asrv.RequestContext, result a2a.SendMessageResult, cause error) {
+	remoteSubagents := findRemoteSubagents(e.config.RunnerConfig.Agent)
+
+	// If task was in input-required and got successfully cancelled - run the cleanup logic
+	if reqCtx.StoredTask != nil && reqCtx.StoredTask.Status.State == a2a.TaskStateInputRequired {
+		if task, ok := result.(*a2a.Task); ok && task.Status.State == a2a.TaskStateCanceled && reqCtx.Message == nil {
+			if err := e.cancelChildInputRequiredTasks(ctx, reqCtx, reqCtx.StoredTask.Status, remoteSubagents); err != nil {
+				log.Warn(ctx, "failed to cancel subagent tasks waiting for input", "cause", err)
+			}
+		}
+	}
+
 	if e.config.A2AExecutionCleanupCallback != nil {
-		e.config.A2AExecutionCleanupCallback(ctx, reqCtx, result, cause)
+		subAgentCards := make([]*a2a.AgentCard, len(remoteSubagents))
+		for i, subagent := range remoteSubagents {
+			subAgentCards[i] = subagent.config.AgentCard
+		}
+		e.config.A2AExecutionCleanupCallback(ctx, reqCtx, subAgentCards, result, cause)
 	} else if cause != nil {
 		if reqCtx.Message != nil {
 			log.Warn(ctx, "execution failed", "error", cause)
@@ -221,9 +230,8 @@ func (e *Executor) Cleanup(ctx context.Context, reqCtx *a2asrv.RequestContext, r
 	}
 }
 
-func (e *Executor) cancelChildInputRequiredTasks(ctx context.Context, reqCtx *a2asrv.RequestContext, status a2a.TaskStatus) error {
-	remoteSubagents := findRemoteSubagents(e.config.RunnerConfig.Agent)
-	if len(remoteSubagents) == 0 {
+func (e *Executor) cancelChildInputRequiredTasks(ctx context.Context, reqCtx *a2asrv.RequestContext, status a2a.TaskStatus, subagents []remoteAgent) error {
+	if len(subagents) == 0 {
 		return nil
 	}
 
@@ -248,11 +256,11 @@ func (e *Executor) cancelChildInputRequiredTasks(ctx context.Context, reqCtx *a2
 	var failures []error
 	clientCache := map[string]*a2aclient.Client{}
 	for _, task := range tasksToCancel { // TODO(yarolegovich): run in parallel (how to limit?)
-		remoteSubagentIdx := slices.IndexFunc(remoteSubagents, func(a remoteAgent) bool { return a.agent.Name() == task.agentName })
+		remoteSubagentIdx := slices.IndexFunc(subagents, func(a remoteAgent) bool { return a.agent.Name() == task.agentName })
 		if remoteSubagentIdx < 0 {
 			continue
 		}
-		remoteSubagent := remoteSubagents[remoteSubagentIdx]
+		remoteSubagent := subagents[remoteSubagentIdx]
 		client, ok := clientCache[task.agentName]
 		if !ok {
 			_, newClient, err := iremoteagent.CreateA2AClient(ctx, remoteSubagent.config)
