@@ -60,11 +60,11 @@ recordings:
           - role: "user"
             parts:
               - text: "Hello"
-      llm_response:
-        content:
-          role: "model"
-          parts:
-            - text: "Recorded response"
+      llm_responses:
+        - content:
+            role: "model"
+            parts:
+              - text: "Recorded response"
 `
 		createRecordingsFile(t, tempDir, recordingsYaml)
 
@@ -440,7 +440,7 @@ func (m *MockToolContext) InvocationID() string                 { return m.invoc
 func (m *MockToolContext) AgentName() string                    { return m.agentName }
 func (m *MockToolContext) FunctionCallID() string               { return "mock-function-call-id" }
 func (m *MockToolContext) Actions() *session.EventActions       { return nil }
-func (m *MockToolContext) SearchMemory(ctx context.Context, query string) (*memory.SearchMemoryResponse, error) {
+func (m *MockToolContext) SearchMemory(ctx context.Context, query string) (*memory.SearchResponse, error) {
 	return nil, nil
 }
 func (m *MockToolContext) ToolConfirmation() *toolconfirmation.ToolConfirmation { return nil }
